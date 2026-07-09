@@ -1,0 +1,533 @@
+name: webOS static LTO benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      translation_units:
+        description: "Generated C++ translation units"
+        required: true
+        default: "128"
+      c_translation_units:
+        description: "Generated C translation units"
+        required: true
+        default: "32"
+      repeats:
+        description: "Cold build repeats per runner"
+        required: true
+        default: "2"
+      parallel:
+        description: "Ninja parallelism"
+        required: true
+        default: "4"
+      opt_level:
+        description: "Optimisation level"
+        required: true
+        default: "-O2"
+        type: choice
+        options:
+          - "-O2"
+          - "-O3"
+          - "-Ofast"
+      lto_flag:
+        description: "LTO flag. Use -flto if -flto=auto is unsupported by your SDK GCC."
+        required: true
+        default: "-flto=auto"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webos-static-lto-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: ${{ matrix.name }} / ${{ inputs.opt_level }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-x64-host-webos-sdk
+            runner: ubuntu-24.04
+            sdk_asset: arm-webos-linux-gnueabi_sdk-buildroot.tar.gz
+
+          - name: ubuntu-arm64-host-webos-sdk
+            runner: ubuntu-24.04-arm
+            sdk_asset: arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            python3 \
+            jq \
+            time \
+            gh \
+            bzip2 \
+            xz-utils \
+            tar \
+            file \
+            findutils \
+            coreutils
+
+      - name: Host facts
+        run: |
+          set -euxo pipefail
+          mkdir -p results
+
+          {
+            echo "## Host facts"
+            echo
+            echo "**Runner label:** ${{ matrix.runner }}"
+            echo
+            echo '```text'
+            uname -a
+            echo
+            lscpu || true
+            echo
+            free -h || true
+            echo
+            df -h || true
+            echo '```'
+          } | tee results/host-facts.md
+
+      - name: Restore cached webOS SDK
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/webos-sdk/arm-webos-linux-gnueabi_sdk-buildroot
+          key: webos-sdk-${{ runner.os }}-${{ runner.arch }}-${{ matrix.sdk_asset }}-v1
+
+      - name: Download and extract webOS SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK_ASSET: ${{ matrix.sdk_asset }}
+        run: |
+          set -euxo pipefail
+
+          SDK_PARENT="$RUNNER_TEMP/webos-sdk"
+          rm -rf "$SDK_PARENT"
+          mkdir -p "$SDK_PARENT"
+
+          gh release download \
+            --repo webosbrew/native-toolchain \
+            --pattern "$SDK_ASSET" \
+            --dir "$SDK_PARENT" \
+            --clobber
+
+          cd "$SDK_PARENT"
+
+          case "$SDK_ASSET" in
+            *.tar.gz)
+              tar -xzf "$SDK_ASSET"
+              ;;
+            *.tar.bz2)
+              tar -xjf "$SDK_ASSET"
+              ;;
+            *)
+              echo "Unknown SDK archive type: $SDK_ASSET" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Relocate and validate webOS SDK
+        run: |
+          set -euxo pipefail
+
+          SDK_PARENT="$RUNNER_TEMP/webos-sdk"
+          SDK_ROOT="$(find "$SDK_PARENT" -maxdepth 3 -type f -name relocate-sdk.sh -printf '%h\n' | head -n1)"
+
+          test -n "$SDK_ROOT"
+          test -f "$SDK_ROOT/relocate-sdk.sh"
+          test -f "$SDK_ROOT/share/buildroot/toolchainfile.cmake"
+
+          "$SDK_ROOT/relocate-sdk.sh"
+
+          TOOL_PREFIX="$SDK_ROOT/bin/arm-webos-linux-gnueabi-"
+
+          test -x "${TOOL_PREFIX}gcc"
+          test -x "${TOOL_PREFIX}g++"
+          test -x "${TOOL_PREFIX}ar"
+          test -x "${TOOL_PREFIX}ranlib"
+
+          # These are required for LTO-safe static archives.
+          test -x "${TOOL_PREFIX}gcc-ar"
+          test -x "${TOOL_PREFIX}gcc-ranlib"
+          test -x "${TOOL_PREFIX}readelf"
+
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake" >> "$GITHUB_ENV"
+          echo "TOOL_PREFIX=$TOOL_PREFIX" >> "$GITHUB_ENV"
+
+          {
+            echo "## SDK facts"
+            echo
+            echo "**SDK root:** \`$SDK_ROOT\`"
+            echo
+            echo '```text'
+            "${TOOL_PREFIX}gcc" --version
+            echo
+            "${TOOL_PREFIX}g++" --version
+            echo
+            file "${TOOL_PREFIX}gcc" "${TOOL_PREFIX}g++" "${TOOL_PREFIX}gcc-ar" "${TOOL_PREFIX}gcc-ranlib"
+            echo '```'
+          } | tee results/sdk-facts.md
+
+      - name: Generate synthetic static C/C++ project
+        env:
+          TU_COUNT: ${{ inputs.translation_units }}
+          C_COUNT: ${{ inputs.c_translation_units }}
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          tu_count = int(os.environ["TU_COUNT"])
+          c_count = int(os.environ["C_COUNT"])
+
+          root = Path("synthetic")
+          for d in ["include", "cpp", "c", "src"]:
+              (root / d).mkdir(parents=True, exist_ok=True)
+
+          (root / "include" / "bench.hpp").write_text(r'''
+          #pragma once
+          #include <stdint.h>
+
+          namespace bench {
+
+          static inline uint32_t rotl32(uint32_t x, unsigned r) {
+              return (uint32_t)((x << r) | (x >> (32u - r)));
+          }
+
+          template<int N>
+          struct Mixer {
+              static inline uint32_t apply(uint32_t x) {
+                  x ^= 0x9e3779b9u + (uint32_t)N * 0x85ebca6bu;
+                  x = rotl32(x, (unsigned)((N % 23) + 5));
+                  x *= 0xc2b2ae35u + (uint32_t)N;
+                  return Mixer<N - 1>::apply(x ^ (x >> 16));
+              }
+          };
+
+          template<>
+          struct Mixer<0> {
+              static inline uint32_t apply(uint32_t x) {
+                  x ^= x >> 15;
+                  x *= 0x2c1b3c6du;
+                  x ^= x >> 12;
+                  x *= 0x297a2d39u;
+                  x ^= x >> 15;
+                  return x;
+              }
+          };
+
+          template<int N>
+          static inline uint32_t mix(uint32_t x) {
+              return Mixer<(N % 37) + 17>::apply(x + (uint32_t)N * 0x9e3779b9u);
+          }
+
+          template<int N, int K>
+          struct Fold {
+              static inline uint32_t apply(uint32_t x) {
+                  return Fold<N, K - 1>::apply(mix<N + K>(x));
+              }
+          };
+
+          template<int N>
+          struct Fold<N, 0> {
+              static inline uint32_t apply(uint32_t x) {
+                  return mix<N>(x);
+              }
+          };
+
+          template<int N>
+          static inline uint32_t hot(uint32_t x) {
+              uint32_t v = Fold<N, 24>::apply(x);
+              for (int i = 0; i < 96; ++i) {
+                  v = mix<N + 101>(v + (uint32_t)i);
+                  v ^= rotl32(v, (unsigned)((i % 13) + 3));
+              }
+              return v;
+          }
+
+          }
+          ''')
+
+          c_headers = []
+          for i in range(c_count):
+              c_headers.append(f"int c_func_{i:03d}(int);")
+              (root / "c" / f"c_unit_{i:03d}.c").write_text(f'''
+          #include <stdint.h>
+
+          __attribute__((noinline))
+          int c_func_{i:03d}(int x) {{
+              uint32_t v = (uint32_t)x + {i}u * 2654435761u;
+              for (int j = 0; j < 96; ++j) {{
+                  v ^= v >> 13;
+                  v *= 1274126177u + (uint32_t)j + {i}u;
+                  v ^= v >> 16;
+              }}
+              return (int)v;
+          }}
+          ''')
+
+          (root / "include" / "c_units.h").write_text(
+              "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+              + "\n".join(c_headers)
+              + "\n#ifdef __cplusplus\n}\n#endif\n"
+          )
+
+          unit_decls = []
+          for i in range(tu_count):
+              cidx0 = i % c_count
+              cidx1 = (i * 7 + 3) % c_count
+              unit_decls.append(f"int unit_{i:03d}(int);")
+              (root / "cpp" / f"unit_{i:03d}.cpp").write_text(f'''
+          #include "bench.hpp"
+          #include "c_units.h"
+
+          __attribute__((noinline))
+          int unit_{i:03d}(int x) {{
+              uint32_t v = (uint32_t)x + {i}u * 0x9e3779b9u;
+              v ^= (uint32_t)c_func_{cidx0:03d}(x);
+              v += (uint32_t)c_func_{cidx1:03d}(x + {i});
+              v = bench::hot<{i}>(v);
+              v ^= bench::Fold<{i + 17}, 18>::apply(v + 12345u);
+              return (int)v;
+          }}
+          ''')
+
+          (root / "include" / "units.hpp").write_text(
+              "#pragma once\n" + "\n".join(unit_decls) + "\n"
+          )
+
+          calls = "\n".join(
+              f"    x ^= unit_{i:03d}(x + {i});" for i in range(tu_count)
+          )
+
+          (root / "src" / "main.cpp").write_text(f'''
+          #include "units.hpp"
+
+          int main(int argc, char **argv) {{
+              int x = argc;
+              (void)argv;
+          {calls}
+              return x & 255;
+          }}
+          ''')
+
+          cpp_sources = "\n".join(f"  cpp/unit_{i:03d}.cpp" for i in range(tu_count))
+          c_sources = "\n".join(f"  c/c_unit_{i:03d}.c" for i in range(c_count))
+
+          (root / "CMakeLists.txt").write_text(f'''
+          cmake_minimum_required(VERSION 3.22)
+          project(webos_static_lto_bench C CXX)
+
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_C_STANDARD_REQUIRED ON)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          # Static-library path to mimic static Qt/C deps/FFmpeg-ish linking.
+          add_library(cstuff STATIC
+          {c_sources}
+          )
+          target_include_directories(cstuff PUBLIC include)
+
+          add_library(cppstuff STATIC
+          {cpp_sources}
+          )
+          target_include_directories(cppstuff PUBLIC include)
+          target_link_libraries(cppstuff PRIVATE cstuff)
+
+          add_executable(webos_bench src/main.cpp)
+          target_include_directories(webos_bench PRIVATE include)
+          target_link_libraries(webos_bench PRIVATE cppstuff cstuff)
+
+          # Make CMake's IPO machinery participate as well as explicit -flto flags.
+          set_property(TARGET cstuff PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+          set_property(TARGET cppstuff PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+          set_property(TARGET webos_bench PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+          ''')
+          PY
+
+          find synthetic -maxdepth 2 -type f | sort | head -80
+
+      - name: Write FFmpeg-equivalent flag notes
+        env:
+          OPT_LEVEL: ${{ inputs.opt_level }}
+          LTO_FLAG: ${{ inputs.lto_flag }}
+        run: |
+          set -euxo pipefail
+
+          CPU_FLAGS="-mcpu=cortex-a53 -mthumb"
+          COMMON_FLAGS="$OPT_LEVEL -pipe $CPU_FLAGS $LTO_FLAG -fuse-linker-plugin -ffunction-sections -fdata-sections"
+          LINK_FLAGS="$LTO_FLAG -fuse-linker-plugin -Wl,--gc-sections"
+
+          cat > results/ffmpeg-equivalent-flags.txt <<EOF
+          Equivalent FFmpeg configure shape for your real build:
+
+          ./configure \\
+            --prefix="\$TARGET_PREFIX" \\
+            --target-os=linux \\
+            --arch=arm \\
+            --cpu=cortex-a53 \\
+            --enable-thumb \\
+            --enable-lto \\
+            --enable-static \\
+            --disable-shared \\
+            --cross-prefix="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-" \\
+            --cc="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-gcc" \\
+            --cxx="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-g++" \\
+            --ar="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-gcc-ar" \\
+            --ranlib="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-gcc-ranlib" \\
+            --extra-cflags="$COMMON_FLAGS" \\
+            --extra-cxxflags="$COMMON_FLAGS" \\
+            --extra-ldflags="$LINK_FLAGS"
+
+          Benchmark C/C++ flags:
+          $COMMON_FLAGS
+
+          Benchmark link flags:
+          $LINK_FLAGS
+          EOF
+
+          cat results/ffmpeg-equivalent-flags.txt
+
+      - name: Build benchmark
+        env:
+          REPEATS: ${{ inputs.repeats }}
+          PARALLEL: ${{ inputs.parallel }}
+          OPT_LEVEL: ${{ inputs.opt_level }}
+          LTO_FLAG: ${{ inputs.lto_flag }}
+        run: |
+          set -euxo pipefail
+
+          CPU_FLAGS="-mcpu=cortex-a53 -mthumb"
+          COMMON_FLAGS="$OPT_LEVEL -pipe $CPU_FLAGS $LTO_FLAG -fuse-linker-plugin -ffunction-sections -fdata-sections"
+          LINK_FLAGS="$LTO_FLAG -fuse-linker-plugin -Wl,--gc-sections"
+
+          C_COMPILER="${TOOL_PREFIX}gcc"
+          CXX_COMPILER="${TOOL_PREFIX}g++"
+          AR_TOOL="${TOOL_PREFIX}gcc-ar"
+          RANLIB_TOOL="${TOOL_PREFIX}gcc-ranlib"
+          READELF_TOOL="${TOOL_PREFIX}readelf"
+          FILE_TOOL="${TOOL_PREFIX}file"
+
+          mkdir -p results
+
+          CSV="results/build-times-${{ matrix.name }}-${{ inputs.opt_level }}.csv"
+          echo "runner,opt_level,lto_flag,repeat,configure_seconds,build_seconds,total_seconds,parallel,translation_units,c_translation_units,common_flags,link_flags" > "$CSV"
+
+          for r in $(seq 1 "$REPEATS"); do
+            BUILD_DIR="build-$r"
+            rm -rf "$BUILD_DIR"
+
+            cfg_start_ns="$(date +%s%N)"
+            cmake -S synthetic -B "$BUILD_DIR" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DCMAKE_C_COMPILER="$C_COMPILER" \
+              -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
+              -DCMAKE_AR="$AR_TOOL" \
+              -DCMAKE_RANLIB="$RANLIB_TOOL" \
+              -DCMAKE_C_COMPILER_AR="$AR_TOOL" \
+              -DCMAKE_C_COMPILER_RANLIB="$RANLIB_TOOL" \
+              -DCMAKE_CXX_COMPILER_AR="$AR_TOOL" \
+              -DCMAKE_CXX_COMPILER_RANLIB="$RANLIB_TOOL" \
+              -DCMAKE_C_FLAGS_RELEASE="$COMMON_FLAGS" \
+              -DCMAKE_CXX_FLAGS_RELEASE="$COMMON_FLAGS" \
+              -DCMAKE_EXE_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
+              -DCMAKE_SHARED_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
+              -DCMAKE_MODULE_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
+              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
+            cfg_end_ns="$(date +%s%N)"
+
+            build_start_ns="$(date +%s%N)"
+            /usr/bin/time -v -o "results/time-repeat-$r.txt" \
+              cmake --build "$BUILD_DIR" --parallel "$PARALLEL"
+            build_end_ns="$(date +%s%N)"
+
+            python3 <<PY >> "$CSV"
+          cfg = ($cfg_end_ns - $cfg_start_ns) / 1e9
+          bld = ($build_end_ns - $build_start_ns) / 1e9
+          total = cfg + bld
+          print("${{ matrix.name }},$OPT_LEVEL,$LTO_FLAG,$r,%.3f,%.3f,%.3f,$PARALLEL,${{ inputs.translation_units }},${{ inputs.c_translation_units }},\\"$COMMON_FLAGS\\",\\"$LINK_FLAGS\\"" % (cfg, bld, total))
+          PY
+
+            echo "### repeat $r file output" | tee "results/file-repeat-$r.txt"
+            "$FILE_TOOL" "$BUILD_DIR/webos_bench" | tee -a "results/file-repeat-$r.txt" || file "$BUILD_DIR/webos_bench" | tee -a "results/file-repeat-$r.txt"
+
+            echo "### repeat $r ARM attributes" | tee "results/readelf-attributes-repeat-$r.txt"
+            "$READELF_TOOL" -A "$BUILD_DIR/webos_bench" | tee -a "results/readelf-attributes-repeat-$r.txt" || true
+
+            echo "### repeat $r linked dynamic deps" | tee "results/readelf-dynamic-repeat-$r.txt"
+            "$READELF_TOOL" -d "$BUILD_DIR/webos_bench" | tee -a "results/readelf-dynamic-repeat-$r.txt" || true
+
+            echo "### repeat $r static archives" | tee "results/static-archives-repeat-$r.txt"
+            find "$BUILD_DIR" -name '*.a' -print -exec ls -lh {} \; | tee -a "results/static-archives-repeat-$r.txt"
+
+            echo "### repeat $r binary size" | tee "results/size-repeat-$r.txt"
+            "${TOOL_PREFIX}size" "$BUILD_DIR/webos_bench" | tee -a "results/size-repeat-$r.txt" || true
+          done
+
+      - name: Summarise result
+        run: |
+          set -euxo pipefail
+
+          {
+            echo "## webOS static LTO benchmark: ${{ matrix.name }} / ${{ inputs.opt_level }}"
+            echo
+            echo "### Build times"
+            echo
+            echo '```csv'
+            cat "results/build-times-${{ matrix.name }}-${{ inputs.opt_level }}.csv"
+            echo '```'
+            echo
+            echo "### FFmpeg-equivalent flags"
+            echo
+            echo '```text'
+            cat results/ffmpeg-equivalent-flags.txt
+            echo '```'
+            echo
+            cat results/host-facts.md
+            echo
+            cat results/sdk-facts.md
+            echo
+            echo "### Final binary attributes, last repeat"
+            echo
+            echo '```text'
+            latest="$(ls results/readelf-attributes-repeat-*.txt | sort | tail -n1)"
+            cat "$latest"
+            echo '```'
+            echo
+            echo "### Final binary dynamic section, last repeat"
+            echo
+            echo '```text'
+            latest_dyn="$(ls results/readelf-dynamic-repeat-*.txt | sort | tail -n1)"
+            cat "$latest_dyn"
+            echo '```'
+          } | tee "results/summary-${{ matrix.name }}-${{ inputs.opt_level }}.md"
+
+          cat "results/summary-${{ matrix.name }}-${{ inputs.opt_level }}.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: webos-static-lto-bench-${{ matrix.name }}-${{ inputs.opt_level }}
+          path: results/
+          retention-days: 30
