@@ -120,6 +120,7 @@ jobs:
           repository: sachk/tern
           ref: master
           path: webos-build
+          token: ${{ secrets.TERN_REPO_TOKEN }}
 
       - name: Install host tools
         run: |
@@ -717,9 +718,9 @@ jobs:
             cat results/*time-${{ matrix.name }}.json 2>/dev/null || true
             echo '```'
             echo
-            cat results/host-facts.md
+            if [[ -f results/host-facts.md ]]; then cat results/host-facts.md; fi
             echo
-            cat results/sdk-facts.md
+            if [[ -f results/sdk-facts.md ]]; then cat results/sdk-facts.md; fi
             echo
             echo "### Artifacts"
             echo
