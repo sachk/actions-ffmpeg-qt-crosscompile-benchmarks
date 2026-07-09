@@ -62,15 +62,15 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: webos-heavy-deps-${{ github.ref }}-${{ matrix.sdk_cache_id }}
-  cancel-in-progress: true
 
 jobs:
   build-heavy-deps:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
+    concurrency:
+      group: webos-heavy-deps-${{ github.ref }}-${{ matrix.sdk_cache_id }}
+      cancel-in-progress: true
 
     strategy:
       fail-fast: false
@@ -158,14 +158,7 @@ jobs:
         id: key
         env:
           USER_CACHE_EPOCH: ${{ inputs.cache_epoch }}
-          HASH_INPUTS: ${{ hashFiles(
-            '.github/workflows/webos-heavy-deps-bench.yml',
-            'tools/**',
-            'patches/**',
-            'manifests/**',
-            '**/qt-webos-*.json',
-            '**/webos-third-party.json'
-          ) }}
+          HASH_INPUTS: ${{ hashFiles('.github/workflows/webos-static-lto-bench.yml', 'tools/**', 'patches/**', 'manifests/**', '**/qt-webos-*.json', '**/webos-third-party.json') }}
         run: |
           set -euxo pipefail
 
