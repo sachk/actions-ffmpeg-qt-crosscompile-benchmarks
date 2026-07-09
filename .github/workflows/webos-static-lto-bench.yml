@@ -18,9 +18,9 @@ on:
         default: ""
 
       qt_build_script:
-        description: "Path to your webOS Qt build script in this benchmark repo"
+        description: "Path to the webOS Qt build script checked out by this workflow"
         required: true
-        default: "tools/webos-native/build-qt6-webos.sh"
+        default: "webos-build/tools/webos-native/build-qt6-611.sh"
 
       build_qt:
         description: "Build static Qt using qt_build_script"
@@ -78,15 +78,17 @@ jobs:
         include:
           - name: ubuntu-x64-host
             runner: ubuntu-24.04
-            sdk_cache_id: linux-x86_64
-            sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot.tar.gz"
-            sdk_asset_glob_2: "arm-webos-linux-gnueabi_sdk-buildroot_linux-x86_64.tar.bz2"
+            sdk_cache_id: linux-aarch64-via-qemu-x86_64
+            sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2"
+            sdk_asset_glob_2: ""
+            needs_aarch64_binfmt: "true"
 
           - name: ubuntu-arm64-host
             runner: ubuntu-24.04-arm
             sdk_cache_id: linux-aarch64
             sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2"
-            sdk_asset_glob_2: "arm-webos-linux-gnueabi_sdk-buildroot_aarch64.tar.bz2"
+            sdk_asset_glob_2: ""
+            needs_aarch64_binfmt: "false"
 
     env:
       TARGET_PREFIX: /usr/local/webos-native
@@ -110,6 +112,14 @@ jobs:
     steps:
       - name: Checkout benchmark repo
         uses: actions/checkout@v4
+
+      - name: Checkout Qt build scripts
+        if: inputs.build_qt == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: sachk/tern
+          ref: master
+          path: webos-build
 
       - name: Install host tools
         run: |
@@ -154,11 +164,20 @@ jobs:
             xz-utils \
             zstd
 
+      - name: Enable aarch64 SDK emulation
+        if: matrix.needs_aarch64_binfmt == 'true'
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get install -y binfmt-support qemu-user-static
+          sudo update-binfmts --enable qemu-aarch64 || true
+          update-binfmts --display qemu-aarch64 || true
+
       - name: Compute cache key
         id: key
         env:
           USER_CACHE_EPOCH: ${{ inputs.cache_epoch }}
-          HASH_INPUTS: ${{ hashFiles('.github/workflows/webos-static-lto-bench.yml', 'tools/**', 'patches/**', 'manifests/**', '**/qt-webos-*.json', '**/webos-third-party.json') }}
+          HASH_INPUTS: ${{ hashFiles('.github/workflows/webos-static-lto-bench.yml', 'webos-build/tools/**', 'webos-build/patches/**', 'webos-build/manifests/**', 'webos-build/**/qt-webos-*.json', 'webos-build/**/webos-third-party.json') }}
         run: |
           set -euxo pipefail
 
@@ -337,8 +356,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            build/qt6-*-host-install
-            build/qt6-*-target-static-install
+            webos-build/build/qt6-*-host-install
+            webos-build/build/qt6-*-target-static-install
             build/webos-ffmpeg-static-stage
             build/webos-ffmpeg-static-prefix
             build/downloads
@@ -379,6 +398,10 @@ jobs:
           test -f "$QT_BUILD_SCRIPT"
           chmod +x "$QT_BUILD_SCRIPT"
 
+          QT_SCRIPT_DIR="$(cd "$(dirname "$QT_BUILD_SCRIPT")" && pwd)"
+          QT_REPO_ROOT="$(cd "$QT_SCRIPT_DIR/../.." && pwd)"
+          QT_BUILD_DIR="$QT_REPO_ROOT/build"
+
           start_ns="$(date +%s%N)"
 
           "$QT_BUILD_SCRIPT" all
@@ -398,7 +421,7 @@ jobs:
           PY
 
           echo "Qt install prefixes:" | tee results/qt-prefixes.txt
-          find build -maxdepth 2 -type d \( -name 'qt6-*-host-install' -o -name 'qt6-*-target-static-install' \) -print | sort | tee -a results/qt-prefixes.txt
+          find "$QT_BUILD_DIR" -maxdepth 2 -type d \( -name 'qt6-*-host-install' -o -name 'qt6-*-target-static-install' \) -print | sort | tee -a results/qt-prefixes.txt
 
       - name: Build strict-whitelist static FFmpeg for webOS
         if: steps.decide.outputs.build_needed == 'true' && inputs.build_ffmpeg == 'true'
@@ -659,8 +682,8 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            build/qt6-*-host-install
-            build/qt6-*-target-static-install
+            webos-build/build/qt6-*-host-install
+            webos-build/build/qt6-*-target-static-install
             build/webos-ffmpeg-static-stage
             build/webos-ffmpeg-static-prefix
             build/downloads
@@ -673,12 +696,12 @@ jobs:
 
           mkdir -p artifacts results
 
-          if compgen -G "build/qt6-*-host-install" >/dev/null; then
-            tar --zstd -cf "artifacts/qt-host-${{ matrix.name }}.tar.zst" build/qt6-*-host-install
+          if compgen -G "webos-build/build/qt6-*-host-install" >/dev/null; then
+            tar --zstd -cf "artifacts/qt-host-${{ matrix.name }}.tar.zst" webos-build/build/qt6-*-host-install
           fi
 
-          if compgen -G "build/qt6-*-target-static-install" >/dev/null; then
-            tar --zstd -cf "artifacts/qt-target-static-${{ matrix.name }}.tar.zst" build/qt6-*-target-static-install
+          if compgen -G "webos-build/build/qt6-*-target-static-install" >/dev/null; then
+            tar --zstd -cf "artifacts/qt-target-static-${{ matrix.name }}.tar.zst" webos-build/build/qt6-*-target-static-install
           fi
 
           if [[ -d build/webos-ffmpeg-static-prefix ]]; then
