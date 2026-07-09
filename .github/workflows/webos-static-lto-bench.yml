@@ -1,84 +1,189 @@
-name: webOS static LTO benchmark
+name: webOS heavy deps benchmark/cache
 
 on:
   workflow_dispatch:
     inputs:
-      translation_units:
-        description: "Generated C++ translation units"
+      force_rebuild:
+        description: "Ignore restored dependency cache and rebuild Qt + FFmpeg"
         required: true
-        default: "128"
-      c_translation_units:
-        description: "Generated C translation units"
-        required: true
-        default: "32"
-      repeats:
-        description: "Cold build repeats per runner"
-        required: true
-        default: "2"
-      parallel:
-        description: "Ninja parallelism"
-        required: true
-        default: "4"
-      opt_level:
-        description: "Optimisation level"
-        required: true
-        default: "-O2"
+        default: "false"
         type: choice
         options:
-          - "-O2"
-          - "-O3"
-          - "-Ofast"
-      lto_flag:
-        description: "LTO flag. Use -flto if -flto=auto is unsupported by your SDK GCC."
+          - "false"
+          - "true"
+
+      cache_epoch:
+        description: "Cache epoch. Blank = current UTC YYYY-MM. Change to force a new cache."
+        required: false
+        default: ""
+
+      qt_build_script:
+        description: "Path to your webOS Qt build script in this benchmark repo"
         required: true
-        default: "-flto=auto"
+        default: "tools/webos-native/build-qt6-webos.sh"
+
+      build_qt:
+        description: "Build static Qt using qt_build_script"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      build_ffmpeg:
+        description: "Build static FFmpeg"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      ffmpeg_url:
+        description: "FFmpeg source tarball URL"
+        required: true
+        default: "https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz"
+
+      ffmpeg_sha256:
+        description: "Optional SHA256 for FFmpeg tarball. Empty = no verification."
+        required: false
+        default: ""
+
+      parallel:
+        description: "Build parallelism"
+        required: true
+        default: "4"
+
+  schedule:
+    # Keeps GitHub cache warm. GitHub cache eviction is access-based.
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: webos-static-lto-bench-${{ github.ref }}
+  group: webos-heavy-deps-${{ github.ref }}-${{ matrix.sdk_cache_id }}
   cancel-in-progress: true
 
 jobs:
-  bench:
-    name: ${{ matrix.name }} / ${{ inputs.opt_level }}
+  build-heavy-deps:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: ubuntu-x64-host-webos-sdk
+          - name: ubuntu-x64-host
             runner: ubuntu-24.04
-            sdk_asset: arm-webos-linux-gnueabi_sdk-buildroot.tar.gz
+            sdk_cache_id: linux-x86_64
+            sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot.tar.gz"
+            sdk_asset_glob_2: "arm-webos-linux-gnueabi_sdk-buildroot_linux-x86_64.tar.bz2"
 
-          - name: ubuntu-arm64-host-webos-sdk
+          - name: ubuntu-arm64-host
             runner: ubuntu-24.04-arm
-            sdk_asset: arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2
+            sdk_cache_id: linux-aarch64
+            sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2"
+            sdk_asset_glob_2: "arm-webos-linux-gnueabi_sdk-buildroot_aarch64.tar.bz2"
+
+    env:
+      TARGET_PREFIX: /usr/local/webos-native
+
+      # Release-ish target profile.
+      WEBOS_OPT_LEVEL: -O2
+      WEBOS_CPU_FLAGS: -mcpu=cortex-a53 -mthumb
+      WEBOS_LTO_FLAG: -flto=auto
+      WEBOS_EXTRA_OPT_FLAGS: -pipe -fuse-linker-plugin -ffunction-sections -fdata-sections
+      WEBOS_EXTRA_LINK_FLAGS: -fuse-linker-plugin -Wl,--gc-sections
+
+      QT_STATIC: "1"
+      QT_BUILD_MEMORY_PER_JOB_MIB: "1536"
+      QT_BUILD_MEMORY_RESERVE_MIB: "2048"
+      QT_TARGET_BUILD_WITH_PCH: "OFF"
+      QT_BUILD_PRUNE_COMPLETED: "1"
+
+      # Keep static dependency cache smaller unless you explicitly want debug info.
+      FFMPEG_DIAG_CFLAGS: ""
 
     steps:
-      - name: Checkout
+      - name: Checkout benchmark repo
         uses: actions/checkout@v4
 
       - name: Install host tools
         run: |
           set -euxo pipefail
+
           sudo apt-get update
           sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            python3 \
-            jq \
-            time \
-            gh \
+            autoconf \
+            automake \
+            bison \
             bzip2 \
-            xz-utils \
-            tar \
+            ca-certificates \
+            cmake \
+            coreutils \
+            curl \
             file \
             findutils \
-            coreutils
+            flex \
+            gawk \
+            gh \
+            git \
+            gperf \
+            jq \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgl1-mesa-dev \
+            libglib2.0-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            make \
+            ninja-build \
+            patch \
+            perl \
+            pkg-config \
+            python3 \
+            rsync \
+            sed \
+            tar \
+            time \
+            wayland-protocols \
+            wayland-scanner \
+            xz-utils \
+            zstd
+
+      - name: Compute cache key
+        id: key
+        env:
+          USER_CACHE_EPOCH: ${{ inputs.cache_epoch }}
+          HASH_INPUTS: ${{ hashFiles(
+            '.github/workflows/webos-heavy-deps-bench.yml',
+            'tools/**',
+            'patches/**',
+            'manifests/**',
+            '**/qt-webos-*.json',
+            '**/webos-third-party.json'
+          ) }}
+        run: |
+          set -euxo pipefail
+
+          if [[ -n "${USER_CACHE_EPOCH:-}" ]]; then
+            epoch="$USER_CACHE_EPOCH"
+          else
+            epoch="$(date -u +%Y-%m)"
+          fi
+
+          flags_slug="o2-cortex-a53-thumb-lto-static-v2"
+          hash_slug="${HASH_INPUTS:-nohash}"
+
+          key="webos-heavy-deps-${{ matrix.sdk_cache_id }}-${flags_slug}-${epoch}-${hash_slug}"
+
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+          echo "cache_key=$key" >> "$GITHUB_OUTPUT"
+
+          echo "Cache key: $key"
 
       - name: Host facts
         run: |
@@ -88,7 +193,7 @@ jobs:
           {
             echo "## Host facts"
             echo
-            echo "**Runner label:** ${{ matrix.runner }}"
+            echo "**Runner:** ${{ matrix.runner }}"
             echo
             echo '```text'
             uname -a
@@ -101,18 +206,19 @@ jobs:
             echo '```'
           } | tee results/host-facts.md
 
-      - name: Restore cached webOS SDK
+      - name: Restore webOS SDK cache
         id: sdk-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/webos-sdk/arm-webos-linux-gnueabi_sdk-buildroot
-          key: webos-sdk-${{ runner.os }}-${{ runner.arch }}-${{ matrix.sdk_asset }}-v1
+          key: webos-sdk-${{ matrix.sdk_cache_id }}-v3
 
       - name: Download and extract webOS SDK
         if: steps.sdk-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          SDK_ASSET: ${{ matrix.sdk_asset }}
+          SDK_GLOB_1: ${{ matrix.sdk_asset_glob_1 }}
+          SDK_GLOB_2: ${{ matrix.sdk_asset_glob_2 }}
         run: |
           set -euxo pipefail
 
@@ -120,55 +226,107 @@ jobs:
           rm -rf "$SDK_PARENT"
           mkdir -p "$SDK_PARENT"
 
-          gh release download \
-            --repo webosbrew/native-toolchain \
-            --pattern "$SDK_ASSET" \
-            --dir "$SDK_PARENT" \
-            --clobber
+          echo "Available native-toolchain releases:"
+          gh release list --repo webosbrew/native-toolchain --limit 20
+
+          found=""
+
+          for tag in $(gh release list --repo webosbrew/native-toolchain --limit 30 --json tagName -q '.[].tagName'); do
+            echo "Checking release $tag"
+
+            assets="$(gh release view "$tag" --repo webosbrew/native-toolchain --json assets -q '.assets[].name')"
+            printf '%s\n' "$assets"
+
+            for pattern in "$SDK_GLOB_1" "$SDK_GLOB_2"; do
+              [[ -n "$pattern" ]] || continue
+
+              match="$(printf '%s\n' "$assets" | python3 - "$pattern" <<'PY'
+import fnmatch
+import sys
+
+pattern = sys.argv[1]
+for line in sys.stdin:
+    name = line.strip()
+    if fnmatch.fnmatch(name, pattern):
+        print(name)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || true
+
+              if [[ -n "$match" ]]; then
+                echo "Downloading asset $match from release $tag"
+                gh release download "$tag" \
+                  --repo webosbrew/native-toolchain \
+                  --pattern "$match" \
+                  --dir "$SDK_PARENT" \
+                  --clobber
+
+                found="$SDK_PARENT/$match"
+                break 2
+              fi
+            done
+          done
+
+          if [[ -z "$found" || ! -f "$found" ]]; then
+            echo "error: no matching SDK asset found for patterns:" >&2
+            echo "  $SDK_GLOB_1" >&2
+            echo "  $SDK_GLOB_2" >&2
+            exit 1
+          fi
 
           cd "$SDK_PARENT"
 
-          case "$SDK_ASSET" in
-            *.tar.gz)
-              tar -xzf "$SDK_ASSET"
-              ;;
-            *.tar.bz2)
-              tar -xjf "$SDK_ASSET"
-              ;;
-            *)
-              echo "Unknown SDK archive type: $SDK_ASSET" >&2
-              exit 1
-              ;;
+          case "$found" in
+            *.tar.gz)  tar -xzf "$found" ;;
+            *.tar.bz2) tar -xjf "$found" ;;
+            *.tar.xz)  tar -xJf "$found" ;;
+            *) echo "Unknown SDK archive type: $found" >&2; exit 1 ;;
           esac
+
+      - name: Save webOS SDK cache
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/webos-sdk/arm-webos-linux-gnueabi_sdk-buildroot
+          key: webos-sdk-${{ matrix.sdk_cache_id }}-v3
 
       - name: Relocate and validate webOS SDK
         run: |
           set -euxo pipefail
 
           SDK_PARENT="$RUNNER_TEMP/webos-sdk"
-          SDK_ROOT="$(find "$SDK_PARENT" -maxdepth 3 -type f -name relocate-sdk.sh -printf '%h\n' | head -n1)"
+          SDK_ROOT="$(find "$SDK_PARENT" -maxdepth 4 -type f -name relocate-sdk.sh -printf '%h\n' | head -n1)"
 
-          test -n "$SDK_ROOT"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "error: could not find relocate-sdk.sh under $SDK_PARENT" >&2
+            find "$SDK_PARENT" -maxdepth 4 -type f | sort > results/sdk-files.txt
+            head -200 results/sdk-files.txt
+            exit 1
+          fi
+
           test -f "$SDK_ROOT/relocate-sdk.sh"
           test -f "$SDK_ROOT/share/buildroot/toolchainfile.cmake"
 
           "$SDK_ROOT/relocate-sdk.sh"
 
           TOOL_PREFIX="$SDK_ROOT/bin/arm-webos-linux-gnueabi-"
+          SYSROOT="$SDK_ROOT/arm-webos-linux-gnueabi/sysroot"
 
           test -x "${TOOL_PREFIX}gcc"
           test -x "${TOOL_PREFIX}g++"
-          test -x "${TOOL_PREFIX}ar"
-          test -x "${TOOL_PREFIX}ranlib"
-
-          # These are required for LTO-safe static archives.
           test -x "${TOOL_PREFIX}gcc-ar"
           test -x "${TOOL_PREFIX}gcc-ranlib"
           test -x "${TOOL_PREFIX}readelf"
+          test -x "${TOOL_PREFIX}strip"
+          test -d "$SYSROOT"
 
+          echo "WEBOS_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake" >> "$GITHUB_ENV"
+          echo "SDK_BIN=$SDK_ROOT/bin" >> "$GITHUB_ENV"
+          echo "SYSROOT=$SYSROOT" >> "$GITHUB_ENV"
           echo "TOOL_PREFIX=$TOOL_PREFIX" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake" >> "$GITHUB_ENV"
 
           {
             echo "## SDK facts"
@@ -184,350 +342,396 @@ jobs:
             echo '```'
           } | tee results/sdk-facts.md
 
-      - name: Generate synthetic static C/C++ project
-        env:
-          TU_COUNT: ${{ inputs.translation_units }}
-          C_COUNT: ${{ inputs.c_translation_units }}
+      - name: Restore heavy dependency cache
+        id: deps-cache
+        if: inputs.force_rebuild != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/qt6-*-host-install
+            build/qt6-*-target-static-install
+            build/webos-ffmpeg-static-stage
+            build/webos-ffmpeg-static-prefix
+            build/downloads
+          key: ${{ steps.key.outputs.cache_key }}
+
+      - name: Decide whether to build
+        id: decide
         run: |
           set -euxo pipefail
 
-          python3 <<'PY'
-          import os
-          from pathlib import Path
+          if [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.deps-cache.outputs.cache-hit }}" == "true" ]]; then
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          fi
 
-          tu_count = int(os.environ["TU_COUNT"])
-          c_count = int(os.environ["C_COUNT"])
-
-          root = Path("synthetic")
-          for d in ["include", "cpp", "c", "src"]:
-              (root / d).mkdir(parents=True, exist_ok=True)
-
-          (root / "include" / "bench.hpp").write_text(r'''
-          #pragma once
-          #include <stdint.h>
-
-          namespace bench {
-
-          static inline uint32_t rotl32(uint32_t x, unsigned r) {
-              return (uint32_t)((x << r) | (x >> (32u - r)));
-          }
-
-          template<int N>
-          struct Mixer {
-              static inline uint32_t apply(uint32_t x) {
-                  x ^= 0x9e3779b9u + (uint32_t)N * 0x85ebca6bu;
-                  x = rotl32(x, (unsigned)((N % 23) + 5));
-                  x *= 0xc2b2ae35u + (uint32_t)N;
-                  return Mixer<N - 1>::apply(x ^ (x >> 16));
-              }
-          };
-
-          template<>
-          struct Mixer<0> {
-              static inline uint32_t apply(uint32_t x) {
-                  x ^= x >> 15;
-                  x *= 0x2c1b3c6du;
-                  x ^= x >> 12;
-                  x *= 0x297a2d39u;
-                  x ^= x >> 15;
-                  return x;
-              }
-          };
-
-          template<int N>
-          static inline uint32_t mix(uint32_t x) {
-              return Mixer<(N % 37) + 17>::apply(x + (uint32_t)N * 0x9e3779b9u);
-          }
-
-          template<int N, int K>
-          struct Fold {
-              static inline uint32_t apply(uint32_t x) {
-                  return Fold<N, K - 1>::apply(mix<N + K>(x));
-              }
-          };
-
-          template<int N>
-          struct Fold<N, 0> {
-              static inline uint32_t apply(uint32_t x) {
-                  return mix<N>(x);
-              }
-          };
-
-          template<int N>
-          static inline uint32_t hot(uint32_t x) {
-              uint32_t v = Fold<N, 24>::apply(x);
-              for (int i = 0; i < 96; ++i) {
-                  v = mix<N + 101>(v + (uint32_t)i);
-                  v ^= rotl32(v, (unsigned)((i % 13) + 3));
-              }
-              return v;
-          }
-
-          }
-          ''')
-
-          c_headers = []
-          for i in range(c_count):
-              c_headers.append(f"int c_func_{i:03d}(int);")
-              (root / "c" / f"c_unit_{i:03d}.c").write_text(f'''
-          #include <stdint.h>
-
-          __attribute__((noinline))
-          int c_func_{i:03d}(int x) {{
-              uint32_t v = (uint32_t)x + {i}u * 2654435761u;
-              for (int j = 0; j < 96; ++j) {{
-                  v ^= v >> 13;
-                  v *= 1274126177u + (uint32_t)j + {i}u;
-                  v ^= v >> 16;
-              }}
-              return (int)v;
-          }}
-          ''')
-
-          (root / "include" / "c_units.h").write_text(
-              "#pragma once\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
-              + "\n".join(c_headers)
-              + "\n#ifdef __cplusplus\n}\n#endif\n"
-          )
-
-          unit_decls = []
-          for i in range(tu_count):
-              cidx0 = i % c_count
-              cidx1 = (i * 7 + 3) % c_count
-              unit_decls.append(f"int unit_{i:03d}(int);")
-              (root / "cpp" / f"unit_{i:03d}.cpp").write_text(f'''
-          #include "bench.hpp"
-          #include "c_units.h"
-
-          __attribute__((noinline))
-          int unit_{i:03d}(int x) {{
-              uint32_t v = (uint32_t)x + {i}u * 0x9e3779b9u;
-              v ^= (uint32_t)c_func_{cidx0:03d}(x);
-              v += (uint32_t)c_func_{cidx1:03d}(x + {i});
-              v = bench::hot<{i}>(v);
-              v ^= bench::Fold<{i + 17}, 18>::apply(v + 12345u);
-              return (int)v;
-          }}
-          ''')
-
-          (root / "include" / "units.hpp").write_text(
-              "#pragma once\n" + "\n".join(unit_decls) + "\n"
-          )
-
-          calls = "\n".join(
-              f"    x ^= unit_{i:03d}(x + {i});" for i in range(tu_count)
-          )
-
-          (root / "src" / "main.cpp").write_text(f'''
-          #include "units.hpp"
-
-          int main(int argc, char **argv) {{
-              int x = argc;
-              (void)argv;
-          {calls}
-              return x & 255;
-          }}
-          ''')
-
-          cpp_sources = "\n".join(f"  cpp/unit_{i:03d}.cpp" for i in range(tu_count))
-          c_sources = "\n".join(f"  c/c_unit_{i:03d}.c" for i in range(c_count))
-
-          (root / "CMakeLists.txt").write_text(f'''
-          cmake_minimum_required(VERSION 3.22)
-          project(webos_static_lto_bench C CXX)
-
-          set(CMAKE_C_STANDARD 11)
-          set(CMAKE_C_STANDARD_REQUIRED ON)
-          set(CMAKE_CXX_STANDARD 17)
-          set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-          # Static-library path to mimic static Qt/C deps/FFmpeg-ish linking.
-          add_library(cstuff STATIC
-          {c_sources}
-          )
-          target_include_directories(cstuff PUBLIC include)
-
-          add_library(cppstuff STATIC
-          {cpp_sources}
-          )
-          target_include_directories(cppstuff PUBLIC include)
-          target_link_libraries(cppstuff PRIVATE cstuff)
-
-          add_executable(webos_bench src/main.cpp)
-          target_include_directories(webos_bench PRIVATE include)
-          target_link_libraries(webos_bench PRIVATE cppstuff cstuff)
-
-          # Make CMake's IPO machinery participate as well as explicit -flto flags.
-          set_property(TARGET cstuff PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-          set_property(TARGET cppstuff PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-          set_property(TARGET webos_bench PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
-          ''')
-          PY
-
-          find synthetic -maxdepth 2 -type f | sort | head -80
-
-      - name: Write FFmpeg-equivalent flag notes
+      - name: Build static Qt via your script
+        if: steps.decide.outputs.build_needed == 'true' && inputs.build_qt == 'true'
         env:
-          OPT_LEVEL: ${{ inputs.opt_level }}
-          LTO_FLAG: ${{ inputs.lto_flag }}
+          QT_BUILD_SCRIPT: ${{ inputs.qt_build_script }}
+          WEBOS_BUILD_JOBS: ${{ inputs.parallel }}
+
+          WEBOS_COMMON_OPT_FLAGS: ${{ env.WEBOS_OPT_LEVEL }} ${{ env.WEBOS_CPU_FLAGS }} ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_OPT_FLAGS }}
+          WEBOS_COMMON_LINK_FLAGS: ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_LINK_FLAGS }}
+
+          WEBOS_TUNE_CFLAGS: ${{ env.WEBOS_OPT_LEVEL }} ${{ env.WEBOS_CPU_FLAGS }} ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_OPT_FLAGS }}
+          QT_TARGET_TUNE_CFLAGS: ${{ env.WEBOS_OPT_LEVEL }} ${{ env.WEBOS_CPU_FLAGS }} ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_OPT_FLAGS }}
+
+          QT_STATIC: "1"
+          QT_BUILD_FRESH: "1"
+          CI: "1"
         run: |
           set -euxo pipefail
-
-          CPU_FLAGS="-mcpu=cortex-a53 -mthumb"
-          COMMON_FLAGS="$OPT_LEVEL -pipe $CPU_FLAGS $LTO_FLAG -fuse-linker-plugin -ffunction-sections -fdata-sections"
-          LINK_FLAGS="$LTO_FLAG -fuse-linker-plugin -Wl,--gc-sections"
-
-          cat > results/ffmpeg-equivalent-flags.txt <<EOF
-          Equivalent FFmpeg configure shape for your real build:
-
-          ./configure \\
-            --prefix="\$TARGET_PREFIX" \\
-            --target-os=linux \\
-            --arch=arm \\
-            --cpu=cortex-a53 \\
-            --enable-thumb \\
-            --enable-lto \\
-            --enable-static \\
-            --disable-shared \\
-            --cross-prefix="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-" \\
-            --cc="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-gcc" \\
-            --cxx="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-g++" \\
-            --ar="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-gcc-ar" \\
-            --ranlib="\$SDK_ROOT/bin/arm-webos-linux-gnueabi-gcc-ranlib" \\
-            --extra-cflags="$COMMON_FLAGS" \\
-            --extra-cxxflags="$COMMON_FLAGS" \\
-            --extra-ldflags="$LINK_FLAGS"
-
-          Benchmark C/C++ flags:
-          $COMMON_FLAGS
-
-          Benchmark link flags:
-          $LINK_FLAGS
-          EOF
-
-          cat results/ffmpeg-equivalent-flags.txt
-
-      - name: Build benchmark
-        env:
-          REPEATS: ${{ inputs.repeats }}
-          PARALLEL: ${{ inputs.parallel }}
-          OPT_LEVEL: ${{ inputs.opt_level }}
-          LTO_FLAG: ${{ inputs.lto_flag }}
-        run: |
-          set -euxo pipefail
-
-          CPU_FLAGS="-mcpu=cortex-a53 -mthumb"
-          COMMON_FLAGS="$OPT_LEVEL -pipe $CPU_FLAGS $LTO_FLAG -fuse-linker-plugin -ffunction-sections -fdata-sections"
-          LINK_FLAGS="$LTO_FLAG -fuse-linker-plugin -Wl,--gc-sections"
-
-          C_COMPILER="${TOOL_PREFIX}gcc"
-          CXX_COMPILER="${TOOL_PREFIX}g++"
-          AR_TOOL="${TOOL_PREFIX}gcc-ar"
-          RANLIB_TOOL="${TOOL_PREFIX}gcc-ranlib"
-          READELF_TOOL="${TOOL_PREFIX}readelf"
-          FILE_TOOL="${TOOL_PREFIX}file"
 
           mkdir -p results
+          test -f "$QT_BUILD_SCRIPT"
+          chmod +x "$QT_BUILD_SCRIPT"
 
-          CSV="results/build-times-${{ matrix.name }}-${{ inputs.opt_level }}.csv"
-          echo "runner,opt_level,lto_flag,repeat,configure_seconds,build_seconds,total_seconds,parallel,translation_units,c_translation_units,common_flags,link_flags" > "$CSV"
+          start_ns="$(date +%s%N)"
 
-          for r in $(seq 1 "$REPEATS"); do
-            BUILD_DIR="build-$r"
-            rm -rf "$BUILD_DIR"
+          "$QT_BUILD_SCRIPT" all
 
-            cfg_start_ns="$(date +%s%N)"
-            cmake -S synthetic -B "$BUILD_DIR" -G Ninja \
-              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DCMAKE_C_COMPILER="$C_COMPILER" \
-              -DCMAKE_CXX_COMPILER="$CXX_COMPILER" \
-              -DCMAKE_AR="$AR_TOOL" \
-              -DCMAKE_RANLIB="$RANLIB_TOOL" \
-              -DCMAKE_C_COMPILER_AR="$AR_TOOL" \
-              -DCMAKE_C_COMPILER_RANLIB="$RANLIB_TOOL" \
-              -DCMAKE_CXX_COMPILER_AR="$AR_TOOL" \
-              -DCMAKE_CXX_COMPILER_RANLIB="$RANLIB_TOOL" \
-              -DCMAKE_C_FLAGS_RELEASE="$COMMON_FLAGS" \
-              -DCMAKE_CXX_FLAGS_RELEASE="$COMMON_FLAGS" \
-              -DCMAKE_EXE_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
-              -DCMAKE_SHARED_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
-              -DCMAKE_MODULE_LINKER_FLAGS_RELEASE="$LINK_FLAGS" \
-              -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON
-            cfg_end_ns="$(date +%s%N)"
+          end_ns="$(date +%s%N)"
 
-            build_start_ns="$(date +%s%N)"
-            /usr/bin/time -v -o "results/time-repeat-$r.txt" \
-              cmake --build "$BUILD_DIR" --parallel "$PARALLEL"
-            build_end_ns="$(date +%s%N)"
+          python3 <<PY > results/qt-time-${{ matrix.name }}.json
+import json
+start = int("$start_ns")
+end = int("$end_ns")
+print(json.dumps({
+    "runner": "${{ matrix.name }}",
+    "component": "qt-static",
+    "seconds": (end - start) / 1e9,
+    "flags": "${{ env.WEBOS_OPT_LEVEL }} ${{ env.WEBOS_CPU_FLAGS }} ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_OPT_FLAGS }}"
+}, indent=2))
+PY
 
-            python3 <<PY >> "$CSV"
-          cfg = ($cfg_end_ns - $cfg_start_ns) / 1e9
-          bld = ($build_end_ns - $build_start_ns) / 1e9
-          total = cfg + bld
-          print("${{ matrix.name }},$OPT_LEVEL,$LTO_FLAG,$r,%.3f,%.3f,%.3f,$PARALLEL,${{ inputs.translation_units }},${{ inputs.c_translation_units }},\\"$COMMON_FLAGS\\",\\"$LINK_FLAGS\\"" % (cfg, bld, total))
-          PY
+          echo "Qt install prefixes:" | tee results/qt-prefixes.txt
+          find build -maxdepth 2 -type d \( -name 'qt6-*-host-install' -o -name 'qt6-*-target-static-install' \) -print | sort | tee -a results/qt-prefixes.txt
 
-            echo "### repeat $r file output" | tee "results/file-repeat-$r.txt"
-            "$FILE_TOOL" "$BUILD_DIR/webos_bench" | tee -a "results/file-repeat-$r.txt" || file "$BUILD_DIR/webos_bench" | tee -a "results/file-repeat-$r.txt"
-
-            echo "### repeat $r ARM attributes" | tee "results/readelf-attributes-repeat-$r.txt"
-            "$READELF_TOOL" -A "$BUILD_DIR/webos_bench" | tee -a "results/readelf-attributes-repeat-$r.txt" || true
-
-            echo "### repeat $r linked dynamic deps" | tee "results/readelf-dynamic-repeat-$r.txt"
-            "$READELF_TOOL" -d "$BUILD_DIR/webos_bench" | tee -a "results/readelf-dynamic-repeat-$r.txt" || true
-
-            echo "### repeat $r static archives" | tee "results/static-archives-repeat-$r.txt"
-            find "$BUILD_DIR" -name '*.a' -print -exec ls -lh {} \; | tee -a "results/static-archives-repeat-$r.txt"
-
-            echo "### repeat $r binary size" | tee "results/size-repeat-$r.txt"
-            "${TOOL_PREFIX}size" "$BUILD_DIR/webos_bench" | tee -a "results/size-repeat-$r.txt" || true
-          done
-
-      - name: Summarise result
+      - name: Build strict-whitelist static FFmpeg for webOS
+        if: steps.decide.outputs.build_needed == 'true' && inputs.build_ffmpeg == 'true'
+        env:
+          FFMPEG_URL: ${{ inputs.ffmpeg_url }}
+          FFMPEG_SHA256: ${{ inputs.ffmpeg_sha256 }}
+          PARALLEL: ${{ inputs.parallel }}
         run: |
           set -euxo pipefail
 
+          COMMON_FLAGS="${WEBOS_OPT_LEVEL} ${WEBOS_CPU_FLAGS} ${WEBOS_LTO_FLAG} ${WEBOS_EXTRA_OPT_FLAGS}"
+          LINK_FLAGS="${WEBOS_LTO_FLAG} ${WEBOS_EXTRA_LINK_FLAGS}"
+
+          mkdir -p build/downloads build/ffmpeg-src build/ffmpeg-build results
+
+          archive="build/downloads/$(basename "$FFMPEG_URL")"
+
+          if [[ ! -f "$archive" ]]; then
+            curl -L --fail --retry 5 --retry-delay 2 "$FFMPEG_URL" -o "$archive"
+          fi
+
+          if [[ -n "${FFMPEG_SHA256:-}" ]]; then
+            echo "${FFMPEG_SHA256}  ${archive}" | sha256sum -c -
+          else
+            echo "warning: FFMPEG_SHA256 empty; source tarball not verified" >&2
+          fi
+
+          rm -rf build/ffmpeg-src build/ffmpeg-build build/webos-ffmpeg-static-stage build/webos-ffmpeg-static-prefix
+          mkdir -p build/ffmpeg-src build/ffmpeg-build build/webos-ffmpeg-static-stage
+
+          tar -xf "$archive" -C build/ffmpeg-src --strip-components=1
+
+          FFMPEG_STAGE="$GITHUB_WORKSPACE/build/webos-ffmpeg-static-stage"
+          FFMPEG_PREFIX="$GITHUB_WORKSPACE/build/webos-ffmpeg-static-prefix"
+
+          export PKG_CONFIG_LIBDIR="$FFMPEG_STAGE$TARGET_PREFIX/lib/pkgconfig:$SYSROOT$TARGET_PREFIX/lib/pkgconfig:$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig"
+          export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+
+          start_ns="$(date +%s%N)"
+
+          cd build/ffmpeg-src
+
+          ./configure \
+            --prefix="$TARGET_PREFIX" \
+            --arch=arm \
+            --cpu=cortex-a53 \
+            --enable-thumb \
+            --target-os=linux \
+            --enable-cross-compile \
+            --cross-prefix="$SDK_BIN/arm-webos-linux-gnueabi-" \
+            --cc="$SDK_BIN/arm-webos-linux-gnueabi-gcc" \
+            --cxx="$SDK_BIN/arm-webos-linux-gnueabi-g++" \
+            --ar="$SDK_BIN/arm-webos-linux-gnueabi-gcc-ar" \
+            --ranlib="$SDK_BIN/arm-webos-linux-gnueabi-gcc-ranlib" \
+            --strip="$SDK_BIN/arm-webos-linux-gnueabi-strip" \
+            --pkg-config="$SDK_BIN/pkg-config" \
+            \
+            --disable-everything \
+            --disable-programs \
+            --disable-doc \
+            --disable-debug \
+            --disable-autodetect \
+            --disable-iconv \
+            \
+            --enable-static \
+            --disable-shared \
+            --enable-pic \
+            --enable-lto \
+            --enable-optimizations \
+            \
+            --enable-avcodec \
+            --enable-avformat \
+            --enable-avutil \
+            --enable-swresample \
+            --enable-swscale \
+            --enable-network \
+            \
+            --enable-protocol=file \
+            --enable-protocol=http \
+            --enable-protocol=https \
+            --enable-protocol=tcp \
+            --enable-protocol=tls \
+            --enable-protocol=pipe \
+            --enable-protocol=crypto \
+            \
+            --enable-demuxer=matroska \
+            --enable-demuxer=mov \
+            --enable-demuxer=mp3 \
+            --enable-demuxer=flac \
+            --enable-demuxer=wav \
+            --enable-demuxer=ogg \
+            --enable-demuxer=mpegts \
+            --enable-demuxer=mpegps \
+            --enable-demuxer=avi \
+            --enable-demuxer=aac \
+            --enable-demuxer=hls \
+            --enable-demuxer=asf \
+            --enable-demuxer=dsf \
+            --enable-demuxer=dff \
+            --enable-demuxer=wv \
+            --enable-demuxer=ape \
+            --enable-demuxer=tta \
+            --enable-demuxer=ass \
+            --enable-demuxer=srt \
+            --enable-demuxer=webvtt \
+            --enable-demuxer=sup \
+            --enable-demuxer=vobsub \
+            \
+            --enable-parser=aac \
+            --enable-parser=ac3 \
+            --enable-parser=dca \
+            --enable-parser=eac3 \
+            --enable-parser=flac \
+            --enable-parser=mlp \
+            --enable-parser=mpegaudio \
+            --enable-parser=opus \
+            --enable-parser=vorbis \
+            --enable-parser=h264 \
+            --enable-parser=hevc \
+            --enable-parser=av1 \
+            --enable-parser=vp9 \
+            --enable-parser=vc1 \
+            --enable-parser=mpeg4video \
+            --enable-parser=mpegvideo \
+            \
+            --enable-decoder=aac \
+            --enable-decoder=ac3 \
+            --enable-decoder=eac3 \
+            --enable-decoder=alac \
+            --enable-decoder=dca \
+            --enable-decoder=truehd \
+            --enable-decoder=mlp \
+            --enable-decoder=flac \
+            --enable-decoder=mp2 \
+            --enable-decoder=mp3 \
+            --enable-decoder=opus \
+            --enable-decoder=vorbis \
+            --enable-decoder=wmav1 \
+            --enable-decoder=wmav2 \
+            --enable-decoder=wmapro \
+            --enable-decoder=wmalossless \
+            --enable-decoder=wavpack \
+            --enable-decoder=ape \
+            --enable-decoder=tta \
+            \
+            --enable-decoder=pcm_bluray \
+            --enable-decoder=pcm_dvd \
+            --enable-decoder=pcm_f32le \
+            --enable-decoder=pcm_f32be \
+            --enable-decoder=pcm_f64le \
+            --enable-decoder=pcm_f64be \
+            --enable-decoder=pcm_s16le \
+            --enable-decoder=pcm_s16be \
+            --enable-decoder=pcm_s24le \
+            --enable-decoder=pcm_s24be \
+            --enable-decoder=pcm_s32le \
+            --enable-decoder=pcm_s32be \
+            --enable-decoder=pcm_u8 \
+            --enable-decoder=pcm_s8 \
+            --enable-decoder=pcm_mulaw \
+            --enable-decoder=pcm_alaw \
+            \
+            --enable-decoder=dsd_lsbf \
+            --enable-decoder=dsd_msbf \
+            --enable-decoder=dsd_lsbf_planar \
+            --enable-decoder=dsd_msbf_planar \
+            --enable-decoder=dst \
+            \
+            --enable-decoder=ass \
+            --enable-decoder=ssa \
+            --enable-decoder=srt \
+            --enable-decoder=subrip \
+            --enable-decoder=text \
+            --enable-decoder=webvtt \
+            --enable-decoder=mov_text \
+            --enable-decoder=hdmv_pgs_subtitle \
+            --enable-decoder=dvdsub \
+            --enable-decoder=dvbsub \
+            --enable-decoder=ccaption \
+            \
+            --enable-decoder=mpeg1video \
+            --enable-decoder=theora \
+            --enable-decoder=h263 \
+            --enable-decoder=vc1 \
+            --enable-decoder=wmv3 \
+            \
+            --enable-encoder=aac \
+            \
+            --enable-muxer=spdif \
+            --enable-muxer=adts \
+            \
+            --enable-bsf=h264_mp4toannexb \
+            --enable-bsf=hevc_mp4toannexb \
+            --enable-bsf=extract_extradata \
+            --enable-bsf=dump_extra \
+            --enable-bsf=h264_metadata \
+            --enable-bsf=hevc_metadata \
+            --enable-bsf=av1_metadata \
+            \
+            --extra-cflags="--sysroot=$SYSROOT -I$FFMPEG_STAGE$TARGET_PREFIX/include $COMMON_FLAGS ${FFMPEG_DIAG_CFLAGS:-}" \
+            --extra-cxxflags="--sysroot=$SYSROOT -I$FFMPEG_STAGE$TARGET_PREFIX/include $COMMON_FLAGS ${FFMPEG_DIAG_CFLAGS:-}" \
+            --extra-ldflags="--sysroot=$SYSROOT -L$FFMPEG_STAGE$TARGET_PREFIX/lib -Wl,-rpath-link,$FFMPEG_STAGE$TARGET_PREFIX/lib $LINK_FLAGS" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/ffmpeg-configure-${{ matrix.name }}.log"
+
+          make -j"$PARALLEL" 2>&1 | tee "$GITHUB_WORKSPACE/results/ffmpeg-make-${{ matrix.name }}.log"
+          make DESTDIR="$FFMPEG_STAGE" install 2>&1 | tee "$GITHUB_WORKSPACE/results/ffmpeg-install-${{ matrix.name }}.log"
+
+          cd "$GITHUB_WORKSPACE"
+
+          mkdir -p "$FFMPEG_PREFIX"
+          rsync -a "$FFMPEG_STAGE$TARGET_PREFIX/" "$FFMPEG_PREFIX/"
+
+          end_ns="$(date +%s%N)"
+
+          python3 <<PY > results/ffmpeg-time-${{ matrix.name }}.json
+import json
+start = int("$start_ns")
+end = int("$end_ns")
+print(json.dumps({
+    "runner": "${{ matrix.name }}",
+    "component": "ffmpeg-static",
+    "seconds": (end - start) / 1e9,
+    "flags": "$COMMON_FLAGS",
+    "link_flags": "$LINK_FLAGS",
+    "prefix": "$FFMPEG_PREFIX"
+}, indent=2))
+PY
+
           {
-            echo "## webOS static LTO benchmark: ${{ matrix.name }} / ${{ inputs.opt_level }}"
-            echo
-            echo "### Build times"
-            echo
-            echo '```csv'
-            cat "results/build-times-${{ matrix.name }}-${{ inputs.opt_level }}.csv"
-            echo '```'
-            echo
-            echo "### FFmpeg-equivalent flags"
+            echo "## FFmpeg static install"
             echo
             echo '```text'
-            cat results/ffmpeg-equivalent-flags.txt
+            find "$FFMPEG_PREFIX" -maxdepth 4 -type f | sort
+            echo
+            echo "Static/shared library files:"
+            find "$FFMPEG_PREFIX/lib" -maxdepth 1 -type f \( -name '*.a' -o -name '*.so*' \) -exec file {} \; | sort || true
+            echo
+            echo "Library sizes:"
+            find "$FFMPEG_PREFIX/lib" -maxdepth 1 -type f -name '*.a' -exec ls -lh {} \; | sort || true
+            echo '```'
+          } | tee results/ffmpeg-install-${{ matrix.name }}.md
+
+          if find "$FFMPEG_PREFIX/lib" -maxdepth 1 -type f -name 'libav*.so*' | grep -q .; then
+            echo "error: shared FFmpeg libs were produced; expected static .a libs only" >&2
+            exit 1
+          fi
+
+          test -f "$FFMPEG_PREFIX/lib/libavcodec.a"
+          test -f "$FFMPEG_PREFIX/lib/libavformat.a"
+          test -f "$FFMPEG_PREFIX/lib/libavutil.a"
+
+          du -sh "$FFMPEG_PREFIX" | tee results/ffmpeg-prefix-size-${{ matrix.name }}.txt
+          tar --zstd -cf "results/ffmpeg-static-prefix-${{ matrix.name }}.tar.zst" -C "$FFMPEG_PREFIX" .
+          ls -lh "results/ffmpeg-static-prefix-${{ matrix.name }}.tar.zst" | tee results/ffmpeg-compressed-size-${{ matrix.name }}.txt
+
+      - name: Save heavy dependency cache
+        if: steps.decide.outputs.build_needed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/qt6-*-host-install
+            build/qt6-*-target-static-install
+            build/webos-ffmpeg-static-stage
+            build/webos-ffmpeg-static-prefix
+            build/downloads
+          key: ${{ steps.key.outputs.cache_key }}
+
+      - name: Package dependency prefixes as artifacts
+        if: always()
+        run: |
+          set -euxo pipefail
+
+          mkdir -p artifacts results
+
+          if compgen -G "build/qt6-*-host-install" >/dev/null; then
+            tar --zstd -cf "artifacts/qt-host-${{ matrix.name }}.tar.zst" build/qt6-*-host-install
+          fi
+
+          if compgen -G "build/qt6-*-target-static-install" >/dev/null; then
+            tar --zstd -cf "artifacts/qt-target-static-${{ matrix.name }}.tar.zst" build/qt6-*-target-static-install
+          fi
+
+          if [[ -d build/webos-ffmpeg-static-prefix ]]; then
+            tar --zstd -cf "artifacts/ffmpeg-static-${{ matrix.name }}.tar.zst" build/webos-ffmpeg-static-prefix
+          fi
+
+          {
+            echo "## webOS heavy deps: ${{ matrix.name }}"
+            echo
+            echo "### Timing"
+            echo
+            echo '```json'
+            cat results/*time-${{ matrix.name }}.json 2>/dev/null || true
             echo '```'
             echo
             cat results/host-facts.md
             echo
             cat results/sdk-facts.md
             echo
-            echo "### Final binary attributes, last repeat"
+            echo "### Artifacts"
             echo
             echo '```text'
-            latest="$(ls results/readelf-attributes-repeat-*.txt | sort | tail -n1)"
-            cat "$latest"
+            ls -lh artifacts || true
             echo '```'
-            echo
-            echo "### Final binary dynamic section, last repeat"
-            echo
-            echo '```text'
-            latest_dyn="$(ls results/readelf-dynamic-repeat-*.txt | sort | tail -n1)"
-            cat "$latest_dyn"
-            echo '```'
-          } | tee "results/summary-${{ matrix.name }}-${{ inputs.opt_level }}.md"
+          } | tee "results/summary-${{ matrix.name }}.md"
 
-          cat "results/summary-${{ matrix.name }}-${{ inputs.opt_level }}.md" >> "$GITHUB_STEP_SUMMARY"
+          cat "results/summary-${{ matrix.name }}.md" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload benchmark results
+      - name: Upload benchmark logs/results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: webos-static-lto-bench-${{ matrix.name }}-${{ inputs.opt_level }}
-          path: results/
+          name: webos-heavy-deps-results-${{ matrix.name }}
+          path: |
+            results/
           retention-days: 30
+
+      - name: Upload packaged dependency prefixes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webos-heavy-deps-prefixes-${{ matrix.name }}
+          path: |
+            artifacts/
+          retention-days: 14
