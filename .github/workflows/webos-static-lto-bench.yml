@@ -149,6 +149,7 @@ jobs:
             libgl1-mesa-dev \
             libglib2.0-dev \
             libwayland-dev \
+            libwayland-bin \
             libxkbcommon-dev \
             make \
             ninja-build \
@@ -161,7 +162,6 @@ jobs:
             tar \
             time \
             wayland-protocols \
-            wayland-scanner \
             xz-utils \
             zstd
 
