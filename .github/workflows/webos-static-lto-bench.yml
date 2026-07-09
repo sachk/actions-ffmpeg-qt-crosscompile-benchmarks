@@ -320,6 +320,10 @@ jobs:
           TOOL_PREFIX="$SDK_ROOT/bin/arm-webos-linux-gnueabi-"
           SYSROOT="$SDK_ROOT/arm-webos-linux-gnueabi/sysroot"
 
+          if [[ "${{ matrix.needs_aarch64_binfmt }}" == "true" ]]; then
+            export QEMU_LD_PREFIX="$SDK_ROOT"
+          fi
+
           test -x "${TOOL_PREFIX}gcc"
           test -x "${TOOL_PREFIX}g++"
           test -x "${TOOL_PREFIX}gcc-ar"
@@ -335,6 +339,9 @@ jobs:
             echo "SYSROOT=$SYSROOT"
             echo "TOOL_PREFIX=$TOOL_PREFIX"
             echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake"
+            if [[ -n "${QEMU_LD_PREFIX:-}" ]]; then
+              echo "QEMU_LD_PREFIX=$QEMU_LD_PREFIX"
+            fi
           } >> "$GITHUB_ENV"
 
           {
