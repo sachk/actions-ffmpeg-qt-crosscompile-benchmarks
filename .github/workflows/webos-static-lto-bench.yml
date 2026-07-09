@@ -409,6 +409,22 @@ jobs:
           QT_REPO_ROOT="$(cd "$QT_SCRIPT_DIR/../.." && pwd)"
           QT_BUILD_DIR="$QT_REPO_ROOT/build"
 
+          patch_file="$QT_SCRIPT_DIR/patches/qtbase-6.11-webos-qtypes-static-assert-c.patch"
+          cat > "$patch_file" <<'PATCH'
+          --- a/src/corelib/global/qtypes.h
+          +++ b/src/corelib/global/qtypes.h
+          @@ -179,7 +179,7 @@
+           #ifndef __cplusplus
+           // In C++ mode, we define below using QIntegerForSize template
+          -static_assert(sizeof(ptrdiff_t) == sizeof(size_t), "Weird ptrdiff_t and size_t definitions");
+          +_Static_assert(sizeof(ptrdiff_t) == sizeof(size_t), "Weird ptrdiff_t and size_t definitions");
+           typedef ptrdiff_t qptrdiff;
+          PATCH
+          if ! grep -Fq 'qtypes-static-assert-c.patch' "$QT_BUILD_SCRIPT"; then
+            # shellcheck disable=SC2016
+            sed -i '/qtbase-\$QT_SERIES-webos-qelfparser.patch/a\  apply_patch_if_needed "$QTBASE_SRC" "$PATCH_DIR/qtbase-$QT_SERIES-webos-qtypes-static-assert-c.patch"' "$QT_BUILD_SCRIPT"
+          fi
+
           start_ns="$(date +%s%N)"
 
           "$QT_BUILD_SCRIPT" all
