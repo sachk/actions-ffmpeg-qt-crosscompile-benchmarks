@@ -233,19 +233,13 @@ jobs:
             for pattern in "$SDK_GLOB_1" "$SDK_GLOB_2"; do
               [[ -n "$pattern" ]] || continue
 
-              match="$(printf '%s\n' "$assets" | python3 - "$pattern" <<'PY'
-import fnmatch
-import sys
-
-pattern = sys.argv[1]
-for line in sys.stdin:
-    name = line.strip()
-    if fnmatch.fnmatch(name, pattern):
-        print(name)
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-)" || true
+              match=""
+              while IFS= read -r asset_name; do
+                if [[ "$asset_name" == "$pattern" ]]; then
+                  match="$asset_name"
+                  break
+                fi
+              done <<< "$assets"
 
               if [[ -n "$match" ]]; then
                 echo "Downloading asset $match from release $tag"
@@ -314,12 +308,14 @@ PY
           test -x "${TOOL_PREFIX}strip"
           test -d "$SYSROOT"
 
-          echo "WEBOS_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "SDK_BIN=$SDK_ROOT/bin" >> "$GITHUB_ENV"
-          echo "SYSROOT=$SYSROOT" >> "$GITHUB_ENV"
-          echo "TOOL_PREFIX=$TOOL_PREFIX" >> "$GITHUB_ENV"
-          echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake" >> "$GITHUB_ENV"
+          {
+            echo "WEBOS_SDK_ROOT=$SDK_ROOT"
+            echo "SDK_ROOT=$SDK_ROOT"
+            echo "SDK_BIN=$SDK_ROOT/bin"
+            echo "SYSROOT=$SYSROOT"
+            echo "TOOL_PREFIX=$TOOL_PREFIX"
+            echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake"
+          } >> "$GITHUB_ENV"
 
           {
             echo "## SDK facts"
@@ -390,16 +386,16 @@ PY
           end_ns="$(date +%s%N)"
 
           python3 <<PY > results/qt-time-${{ matrix.name }}.json
-import json
-start = int("$start_ns")
-end = int("$end_ns")
-print(json.dumps({
-    "runner": "${{ matrix.name }}",
-    "component": "qt-static",
-    "seconds": (end - start) / 1e9,
-    "flags": "${{ env.WEBOS_OPT_LEVEL }} ${{ env.WEBOS_CPU_FLAGS }} ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_OPT_FLAGS }}"
-}, indent=2))
-PY
+          import json
+          start = int("$start_ns")
+          end = int("$end_ns")
+          print(json.dumps({
+              "runner": "${{ matrix.name }}",
+              "component": "qt-static",
+              "seconds": (end - start) / 1e9,
+              "flags": "${{ env.WEBOS_OPT_LEVEL }} ${{ env.WEBOS_CPU_FLAGS }} ${{ env.WEBOS_LTO_FLAG }} ${{ env.WEBOS_EXTRA_OPT_FLAGS }}"
+          }, indent=2))
+          PY
 
           echo "Qt install prefixes:" | tee results/qt-prefixes.txt
           find build -maxdepth 2 -type d \( -name 'qt6-*-host-install' -o -name 'qt6-*-target-static-install' \) -print | sort | tee -a results/qt-prefixes.txt
@@ -618,18 +614,18 @@ PY
           end_ns="$(date +%s%N)"
 
           python3 <<PY > results/ffmpeg-time-${{ matrix.name }}.json
-import json
-start = int("$start_ns")
-end = int("$end_ns")
-print(json.dumps({
-    "runner": "${{ matrix.name }}",
-    "component": "ffmpeg-static",
-    "seconds": (end - start) / 1e9,
-    "flags": "$COMMON_FLAGS",
-    "link_flags": "$LINK_FLAGS",
-    "prefix": "$FFMPEG_PREFIX"
-}, indent=2))
-PY
+          import json
+          start = int("$start_ns")
+          end = int("$end_ns")
+          print(json.dumps({
+              "runner": "${{ matrix.name }}",
+              "component": "ffmpeg-static",
+              "seconds": (end - start) / 1e9,
+              "flags": "$COMMON_FLAGS",
+              "link_flags": "$LINK_FLAGS",
+              "prefix": "$FFMPEG_PREFIX"
+          }, indent=2))
+          PY
 
           {
             echo "## FFmpeg static install"
@@ -641,7 +637,7 @@ PY
             find "$FFMPEG_PREFIX/lib" -maxdepth 1 -type f \( -name '*.a' -o -name '*.so*' \) -exec file {} \; | sort || true
             echo
             echo "Library sizes:"
-            find "$FFMPEG_PREFIX/lib" -maxdepth 1 -type f -name '*.a' -exec ls -lh {} \; | sort || true
+            find "$FFMPEG_PREFIX/lib" -maxdepth 1 -type f -name '*.a' -printf '%M %10s %p\n' | sort || true
             echo '```'
           } | tee results/ffmpeg-install-${{ matrix.name }}.md
 
@@ -656,7 +652,7 @@ PY
 
           du -sh "$FFMPEG_PREFIX" | tee results/ffmpeg-prefix-size-${{ matrix.name }}.txt
           tar --zstd -cf "results/ffmpeg-static-prefix-${{ matrix.name }}.tar.zst" -C "$FFMPEG_PREFIX" .
-          ls -lh "results/ffmpeg-static-prefix-${{ matrix.name }}.tar.zst" | tee results/ffmpeg-compressed-size-${{ matrix.name }}.txt
+          stat -c '%A %10s %n' "results/ffmpeg-static-prefix-${{ matrix.name }}.tar.zst" | tee results/ffmpeg-compressed-size-${{ matrix.name }}.txt
 
       - name: Save heavy dependency cache
         if: steps.decide.outputs.build_needed == 'true'
@@ -705,7 +701,7 @@ PY
             echo "### Artifacts"
             echo
             echo '```text'
-            ls -lh artifacts || true
+            find artifacts -maxdepth 1 -mindepth 1 -printf '%M %10s %p\n' | sort || true
             echo '```'
           } | tee "results/summary-${{ matrix.name }}.md"
 
