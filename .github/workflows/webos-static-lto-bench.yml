@@ -78,17 +78,19 @@ jobs:
         include:
           - name: ubuntu-x64-host
             runner: ubuntu-24.04
-            sdk_cache_id: linux-aarch64-via-qemu-x86_64
-            sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2"
+            sdk_cache_id: linux-x86_64
+            sdk_asset_glob_1: ""
             sdk_asset_glob_2: ""
-            needs_aarch64_binfmt: "true"
+            sdk_archive_url: "https://github.com/openlgtv/buildroot-nc4/releases/download/webos-a38c582/arm-webos-linux-gnueabi_sdk-buildroot-x86_64.tar.gz"
+            sdk_archive_sha256: "04ad3311b48b4557a7002aef56ae2e167478e8e129f37daac04649bddf813616"
 
           - name: ubuntu-arm64-host
             runner: ubuntu-24.04-arm
             sdk_cache_id: linux-aarch64
             sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2"
             sdk_asset_glob_2: ""
-            needs_aarch64_binfmt: "false"
+            sdk_archive_url: ""
+            sdk_archive_sha256: ""
 
     env:
       TARGET_PREFIX: /usr/local/webos-native
@@ -165,14 +167,6 @@ jobs:
             xz-utils \
             zstd
 
-      - name: Enable aarch64 SDK emulation
-        if: matrix.needs_aarch64_binfmt == 'true'
-        run: |
-          set -euxo pipefail
-
-          sudo apt-get install -y binfmt-support qemu-user-static
-          sudo update-binfmts --enable qemu-aarch64 || true
-          update-binfmts --display qemu-aarch64 || true
 
       - name: Compute cache key
         id: key
@@ -232,6 +226,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SDK_GLOB_1: ${{ matrix.sdk_asset_glob_1 }}
           SDK_GLOB_2: ${{ matrix.sdk_asset_glob_2 }}
+          SDK_ARCHIVE_URL: ${{ matrix.sdk_archive_url }}
+          SDK_ARCHIVE_SHA256: ${{ matrix.sdk_archive_sha256 }}
         run: |
           set -euxo pipefail
 
@@ -239,47 +235,56 @@ jobs:
           rm -rf "$SDK_PARENT"
           mkdir -p "$SDK_PARENT"
 
-          echo "Available native-toolchain releases:"
-          gh release list --repo webosbrew/native-toolchain --limit 20
-
           found=""
 
-          for tag in $(gh release list --repo webosbrew/native-toolchain --limit 30 --json tagName -q '.[].tagName'); do
-            echo "Checking release $tag"
+          if [[ -n "${SDK_ARCHIVE_URL:-}" ]]; then
+            found="$SDK_PARENT/$(basename "$SDK_ARCHIVE_URL")"
+            curl -L --fail --retry 5 --retry-delay 2 "$SDK_ARCHIVE_URL" -o "$found"
 
-            assets="$(gh release view "$tag" --repo webosbrew/native-toolchain --json assets -q '.assets[].name')"
-            printf '%s\n' "$assets"
+            if [[ -n "${SDK_ARCHIVE_SHA256:-}" ]]; then
+              echo "${SDK_ARCHIVE_SHA256}  ${found}" | sha256sum -c -
+            fi
+          else
+            echo "Available native-toolchain releases:"
+            gh release list --repo webosbrew/native-toolchain --limit 20
 
-            for pattern in "$SDK_GLOB_1" "$SDK_GLOB_2"; do
-              [[ -n "$pattern" ]] || continue
+            for tag in $(gh release list --repo webosbrew/native-toolchain --limit 30 --json tagName -q '.[].tagName'); do
+              echo "Checking release $tag"
 
-              match=""
-              while IFS= read -r asset_name; do
-                if [[ "$asset_name" == "$pattern" ]]; then
-                  match="$asset_name"
-                  break
+              assets="$(gh release view "$tag" --repo webosbrew/native-toolchain --json assets -q '.assets[].name')"
+              printf '%s\n' "$assets"
+
+              for pattern in "$SDK_GLOB_1" "$SDK_GLOB_2"; do
+                [[ -n "$pattern" ]] || continue
+
+                match=""
+                while IFS= read -r asset_name; do
+                  if [[ "$asset_name" == "$pattern" ]]; then
+                    match="$asset_name"
+                    break
+                  fi
+                done <<< "$assets"
+
+                if [[ -n "$match" ]]; then
+                  echo "Downloading asset $match from release $tag"
+                  gh release download "$tag" \
+                    --repo webosbrew/native-toolchain \
+                    --pattern "$match" \
+                    --dir "$SDK_PARENT" \
+                    --clobber
+
+                  found="$SDK_PARENT/$match"
+                  break 2
                 fi
-              done <<< "$assets"
-
-              if [[ -n "$match" ]]; then
-                echo "Downloading asset $match from release $tag"
-                gh release download "$tag" \
-                  --repo webosbrew/native-toolchain \
-                  --pattern "$match" \
-                  --dir "$SDK_PARENT" \
-                  --clobber
-
-                found="$SDK_PARENT/$match"
-                break 2
-              fi
+              done
             done
-          done
 
-          if [[ -z "$found" || ! -f "$found" ]]; then
-            echo "error: no matching SDK asset found for patterns:" >&2
-            echo "  $SDK_GLOB_1" >&2
-            echo "  $SDK_GLOB_2" >&2
-            exit 1
+            if [[ -z "$found" || ! -f "$found" ]]; then
+              echo "error: no matching SDK asset found for patterns:" >&2
+              echo "  $SDK_GLOB_1" >&2
+              echo "  $SDK_GLOB_2" >&2
+              exit 1
+            fi
           fi
 
           cd "$SDK_PARENT"
@@ -320,9 +325,6 @@ jobs:
           TOOL_PREFIX="$SDK_ROOT/bin/arm-webos-linux-gnueabi-"
           SYSROOT="$SDK_ROOT/arm-webos-linux-gnueabi/sysroot"
 
-          if [[ "${{ matrix.needs_aarch64_binfmt }}" == "true" ]]; then
-            export QEMU_LD_PREFIX="$SDK_ROOT"
-          fi
 
           test -x "${TOOL_PREFIX}gcc"
           test -x "${TOOL_PREFIX}g++"
@@ -339,9 +341,6 @@ jobs:
             echo "SYSROOT=$SYSROOT"
             echo "TOOL_PREFIX=$TOOL_PREFIX"
             echo "TOOLCHAIN_FILE=$SDK_ROOT/share/buildroot/toolchainfile.cmake"
-            if [[ -n "${QEMU_LD_PREFIX:-}" ]]; then
-              echo "QEMU_LD_PREFIX=$QEMU_LD_PREFIX"
-            fi
           } >> "$GITHUB_ENV"
 
           {
