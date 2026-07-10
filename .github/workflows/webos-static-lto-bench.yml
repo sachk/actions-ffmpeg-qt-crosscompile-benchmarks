@@ -86,11 +86,11 @@ jobs:
 
           - name: ubuntu-arm64-host
             runner: ubuntu-24.04-arm
-            sdk_cache_id: linux-aarch64
-            sdk_asset_glob_1: "arm-webos-linux-gnueabi_sdk-buildroot_linux-aarch64.tar.bz2"
+            sdk_cache_id: linux-aarch64-nc4-a38c582
+            sdk_asset_glob_1: ""
             sdk_asset_glob_2: ""
-            sdk_archive_url: ""
-            sdk_archive_sha256: ""
+            sdk_archive_url: "https://github.com/openlgtv/buildroot-nc4/releases/download/webos-a38c582/arm-webos-linux-gnueabi_sdk-buildroot-aarch64.tar.gz"
+            sdk_archive_sha256: "566f9f4fa53338b5fca3d97f495571c58af9b4c11bcdcb477fe51c7518a571c2"
 
     env:
       TARGET_PREFIX: /usr/local/webos-native
